@@ -1,0 +1,525 @@
+#!/bin/bash
+# ═══════════════════════════════════════════════════════════════════════
+#  AndyLuxor Panel — Instalador v1.0
+#  Uso: sudo bash setup
+# ═══════════════════════════════════════════════════════════════════════
+set -euo pipefail
+
+R='\e[31m'; G='\e[32m'; Y='\e[33m'; B='\e[36m'; M='\e[35m'; C='\e[96m'
+BOLD='\e[1m'; DIM='\e[2m'; N='\e[0m'
+
+log()  { echo -e "${G}✓${N} $*"; }
+warn() { echo -e "${Y}⚠${N} $*"; }
+err()  { echo -e "${R}✗${N} $*"; exit 1; }
+info() { echo -e "${B}ℹ${N} $*"; }
+
+clear
+echo -e "${M}${BOLD}"
+cat <<'BANNER'
+   ╔══════════════════════════════════════════════════════════════╗
+   ║                                                              ║
+   ║        🛰️  ANDYLUXOR PANEL  —  INSTALADOR v1.0  🛰️         ║
+   ║                                                              ║
+   ╚══════════════════════════════════════════════════════════════╝
+BANNER
+echo -e "${N}"
+
+[[ $EUID -ne 0 ]] && err "Debes ejecutar como root"
+
+# ═══ Parámetros ═══
+echo -e "${M}${BOLD}═══ CONFIGURACIÓN DEL PANEL ═══${N}"
+echo
+
+while true; do
+    read -p "$(echo -e "${C}?${N} Subdominio (ej: arg1, cl, br): ")" VPS_HOSTNAME
+    VPS_HOSTNAME=$(echo "$VPS_HOSTNAME" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+    [[ "$VPS_HOSTNAME" =~ ^[a-z0-9-]{2,32}$ ]] && break
+    warn "Solo minúsculas/números/guiones (2-32 chars)"
+done
+
+while true; do
+    read -p "$(echo -e "${C}?${N} Dominio base (ej: andyluxor2025.store): ")" DOMINIO_BASE
+    DOMINIO_BASE=$(echo "$DOMINIO_BASE" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+    [[ "$DOMINIO_BASE" =~ ^[a-z0-9.-]+\.[a-z]{2,}$ ]] && break
+    warn "Dominio inválido"
+done
+
+echo
+echo -e "${DIM}  Contraseña universal para usuarios TOKEN${N}"
+while true; do
+    read -s -p "$(echo -e "${C}?${N} Contraseña general: ")" GENERAL_PASS; echo
+    read -s -p "$(echo -e "${C}?${N} Confirmar contraseña: ")" GENERAL_PASS2; echo
+    [[ "$GENERAL_PASS" == "$GENERAL_PASS2" ]] && [[ ${#GENERAL_PASS} -ge 6 ]] && break
+    warn "No coinciden o son muy cortas (mín 6)"
+done
+
+API_KEY=$(openssl rand -hex 32)
+FULL_DOMAIN="${VPS_HOSTNAME}.${DOMINIO_BASE}"
+
+echo
+echo -e "${M}${BOLD}═══ RESUMEN ═══${N}"
+echo -e "  Hostname      : ${VPS_HOSTNAME}"
+echo -e "  Dominio base  : ${DOMINIO_BASE}"
+echo -e "  Dominio final : ${C}${FULL_DOMAIN}${N}"
+echo -e "  Pass general  : ${DIM}••••••••${N}"
+echo
+read -p "$(echo -e "${C}?${N} ¿Continuar? (s/n): ")" CONFIRM
+[[ "$CONFIRM" != "s" ]] && { warn "Cancelado"; exit 0; }
+
+echo
+echo -e "${M}${BOLD}═══ INSTALANDO ═══${N}"
+
+# ═══ 1. Dependencias ═══
+info "Instalando dependencias..."
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq expect apache2 php php-cli libapache2-mod-php curl openssl python3 2>&1 | tail -1
+log "Dependencias OK"
+
+# ═══ 2. Apache ═══
+APACHE_PORT=8880
+APACHE_SSL_PORT=8443
+
+info "Configurando Apache..."
+cat > /etc/apache2/ports.conf <<EOF
+Listen $APACHE_PORT
+<IfModule ssl_module>
+    Listen $APACHE_SSL_PORT
+</IfModule>
+<IfModule mod_gnutls.c>
+    Listen $APACHE_SSL_PORT
+</IfModule>
+EOF
+
+cat > /etc/apache2/sites-available/000-default.conf <<EOF
+<VirtualHost *:$APACHE_PORT>
+    ServerName $FULL_DOMAIN
+    DocumentRoot /var/www/html
+    <Directory /var/www/html>
+        Options -Indexes +FollowSymLinks
+        AllowOverride All
+        Require all granted
+    </Directory>
+    ErrorLog \${APACHE_LOG_DIR}/error.log
+    CustomLog \${APACHE_LOG_DIR}/access.log combined
+</VirtualHost>
+EOF
+
+a2enmod rewrite headers >/dev/null
+apachectl configtest 2>&1 | grep -q "Syntax OK" || err "Apache config inválido"
+systemctl restart apache2
+systemctl enable apache2 >/dev/null 2>&1
+log "Apache OK en :$APACHE_PORT"
+
+# ═══ 3. Estructura ═══
+mkdir -p /var/www/html/api /etc/ssh-api /usr/local/bin
+
+# ═══ 4. Passwords ═══
+[ ! -f /etc/reagens_base_pass ] && echo -n "$GENERAL_PASS" > /etc/reagens_base_pass
+echo -n "$GENERAL_PASS" > /etc/ssh-api/general_password
+chmod 644 /etc/reagens_base_pass
+chown root:www-data /etc/reagens_base_pass
+chmod 600 /etc/ssh-api/general_password
+chown root:root /etc/ssh-api/general_password
+log "Contraseñas OK"
+
+# ═══ 5. expect-token.exp ═══
+cat > /usr/local/bin/expect-token.exp <<'EXPECTEOF'
+#!/usr/bin/expect -f
+set timeout 60
+log_user 1
+set env(LANG) "C.UTF-8"
+set env(LC_ALL) "C.UTF-8"
+set token [lindex $argv 0]
+set alias [lindex $argv 1]
+set dias  [lindex $argv 2]
+set gb    [lindex $argv 3]
+spawn /bin/addssh
+expect { -re {Opc \[1-6/x\]:}  { sleep 0.3; send "3\r" } timeout { exit 91 } }
+expect { -re {Nombre del Cliente}  { sleep 0.3; send "$alias\r" } timeout { exit 92 } }
+expect { -re {Ingresa el TOKEN}  { sleep 0.3; send "$token\r" } timeout { exit 93 } }
+expect {
+    -re {D.{1,3}as de duraci}  { sleep 0.3; send "$dias\r" }
+    -re {D.as de duraci}       { sleep 0.3; send "$dias\r" }
+    timeout { exit 94 }
+}
+expect {
+    -re {L.{0,3}mite de Datos}  { sleep 0.3; send "$gb\r" }
+    -re {mite de Datos}         { sleep 0.3; send "$gb\r" }
+    timeout { exit 95 }
+}
+expect { -re {Crear usuario\?}  { sleep 0.3; send "s\r" } timeout { exit 96 } }
+expect { -re {Presione enter}  { sleep 0.3; send "\r" } timeout { } }
+expect eof
+exit 0
+EXPECTEOF
+chmod 755 /usr/local/bin/expect-token.exp
+log "expect-token.exp OK"
+
+# ═══ 6. Wrappers ═══
+cat > /usr/local/bin/ssh-api-add.sh <<'ADDEOF'
+#!/bin/bash
+set -euo pipefail
+TOKEN="$1"; ALIAS="$2"; DIAS="${3:-30}"; GB="${4:-0}"
+export LANG=C.UTF-8 LC_ALL=C.UTF-8
+[[ "$TOKEN" =~ ^[a-zA-Z0-9_]{6,32}$ ]] || { echo "Token inválido"; exit 1; }
+[[ "$DIAS" =~ ^[0-9]+$ ]] && [ "$DIAS" -ge 1 ] && [ "$DIAS" -le 365 ] || { echo "Días inválidos"; exit 1; }
+[[ "$GB" =~ ^[0-9]+$ ]] || { echo "GB inválidos"; exit 1; }
+exec expect /usr/local/bin/expect-token.exp "$TOKEN" "$ALIAS" "$DIAS" "$GB"
+ADDEOF
+
+cat > /usr/local/bin/ssh-api-del.sh <<'DELEOF'
+#!/bin/bash
+set -uo pipefail
+TOKEN="${1:-}"
+[[ -z "$TOKEN" ]] && { echo "Falta token"; exit 1; }
+[[ ! "$TOKEN" =~ ^[a-zA-Z0-9_]{6,32}$ ]] && { echo "Token inválido"; exit 1; }
+export LC_ALL=C
+[ -f /etc/adm-lite/usuarios_token.db ] && sed -i "/^${TOKEN}|/d" /etc/adm-lite/usuarios_token.db
+[ -f /etc/ssh/.ssh.db ] && sed -i "/^### ${TOKEN} /d" /etc/ssh/.ssh.db
+if [ -f /etc/ssh/traffic.db ]; then
+python3 - "$TOKEN" <<'PYEOF'
+import json, sys
+try:
+    with open("/etc/ssh/traffic.db") as f: d = json.load(f)
+    d.pop(sys.argv[1], None)
+    with open("/etc/ssh/traffic.db","w") as f: json.dump(d, f, indent=2)
+except: pass
+PYEOF
+fi
+[ -f /etc/hysteria2/users.txt ] && sed -i "/^${TOKEN} /d" /etc/hysteria2/users.txt
+if [ -f /etc/ssh/quotas.db ]; then
+python3 - "$TOKEN" <<'PYEOF'
+import json, sys
+try:
+    with open("/etc/ssh/quotas.db") as f: d = json.load(f)
+    d.pop(sys.argv[1], None)
+    with open("/etc/ssh/quotas.db","w") as f: json.dump(d, f, indent=4)
+except: pass
+PYEOF
+fi
+rm -f "/etc/ssh/sshd_config.d/${TOKEN}.conf"
+rm -f "/etc/ssh/banners/banner_${TOKEN}.txt"
+rm -f "/var/www/html/ssh-${TOKEN}.txt"
+id "$TOKEN" >/dev/null 2>&1 && userdel "$TOKEN" 2>/dev/null
+systemctl reload ssh 2>/dev/null || true
+echo ">>> Eliminado $TOKEN"
+DELEOF
+
+cat > /usr/local/bin/ssh-api-list.sh <<'LISTEOF'
+#!/bin/bash
+export LC_ALL=C
+for f in /var/www/html/ssh-*.txt; do
+    [ -e "$f" ] || continue
+    token=$(basename "$f" | sed 's/^ssh-//;s/\.txt$//')
+    alias=$(grep -m1 '^Alias:' "$f" 2>/dev/null | cut -d: -f2- | sed 's/^ *//;s/ *$//')
+    host=$(grep -m1 '^Host:' "$f" 2>/dev/null | cut -d: -f2- | sed 's/^ *//;s/ *$//')
+    exp_raw=$(chage -l "$token" 2>/dev/null | grep -i 'Account expires' | cut -d: -f2- | sed 's/^ *//;s/ *$//')
+    if [ "$exp_raw" = "never" ] || [ -z "$exp_raw" ]; then exp=""; else
+        exp=$(date -d "$exp_raw" +%Y-%m-%d 2>/dev/null || echo "")
+    fi
+    echo "$token|$alias|$host|$exp"
+done
+LISTEOF
+
+chmod 755 /usr/local/bin/ssh-api-add.sh /usr/local/bin/ssh-api-del.sh /usr/local/bin/ssh-api-list.sh
+log "Wrappers OK"
+
+# ═══ 7. Sudoers ═══
+cat > /etc/sudoers.d/ssh-api <<'SUDOEOF'
+www-data ALL=(root) NOPASSWD: /usr/bin/chage, /usr/bin/expect, /usr/sbin/userdel, /usr/sbin/chpasswd, /usr/local/bin/expect-token.exp, /usr/local/bin/ssh-api-add.sh, /usr/local/bin/ssh-api-list.sh, /usr/local/bin/ssh-api-del.sh, /bin/dellssh, /bin/renewssh
+SUDOEOF
+chmod 440 /etc/sudoers.d/ssh-api
+log "Sudoers OK"
+
+# ═══ 8. config.php ═══
+cat > /var/www/html/api/config.php <<PHPEOF
+<?php
+define('API_KEY', '${API_KEY}');
+define('TXT_DIR', '/var/www/html/');
+define('VPS_HOST', '${VPS_HOSTNAME}');
+function checkApiKey() {
+    \$h = \$_SERVER['HTTP_X_API_KEY'] ?? '';
+    if (!hash_equals(API_KEY, \$h)) {
+        http_response_code(401);
+        header('Content-Type: application/json');
+        echo json_encode(['error' => 'No autorizado']);
+        exit;
+    }
+}
+function json(\$d, \$c = 200) {
+    http_response_code(\$c);
+    header('Content-Type: application/json; charset=utf-8');
+    header('Access-Control-Allow-Origin: *');
+    header('Access-Control-Allow-Headers: Content-Type, X-API-Key');
+    header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
+    if (\$_SERVER['REQUEST_METHOD'] === 'OPTIONS') exit;
+    echo json_encode(\$d, JSON_UNESCAPED_UNICODE);
+    exit;
+}
+function leerTxt(\$token) {
+    \$token = preg_replace('/[^a-zA-Z0-9_]/', '', \$token);
+    \$f = TXT_DIR . 'ssh-' . \$token . '.txt';
+    if (!is_file(\$f)) return null;
+    \$d = [];
+    foreach (file(\$f, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as \$l) {
+        if (strpos(\$l, ':') !== false) {
+            [\$k, \$v] = explode(':', \$l, 2);
+            \$d[trim(\$k)] = trim(\$v);
+        }
+    }
+    return \$d;
+}
+function getExpira(\$token) {
+    \$token = preg_replace('/[^a-zA-Z0-9_]/', '', \$token);
+    \$out = [];
+    exec('sudo /usr/bin/chage -l ' . escapeshellarg(\$token) . ' 2>/dev/null', \$out);
+    foreach (\$out as \$line) {
+        if (stripos(\$line, 'Account expires') !== false) {
+            \$val = trim(explode(':', \$line, 2)[1] ?? '');
+            if (\$val === '' || stripos(\$val, 'never') !== false) return null;
+            \$ts = strtotime(\$val);
+            return \$ts ? date('Y-m-d', \$ts) : null;
+        }
+    }
+    return null;
+}
+PHPEOF
+
+# ═══ 9. listar_usuarios.php ═══
+cat > /var/www/html/api/listar_usuarios.php <<'PHPEOF'
+<?php
+require 'config.php';
+checkApiKey();
+exec('sudo /usr/local/bin/ssh-api-list.sh 2>/dev/null', $out);
+$hoy = new DateTime('today');
+$usuarios = [];
+foreach ($out as $line) {
+    $parts = explode('|', $line);
+    if (count($parts) < 4) continue;
+    [$token, $alias, $host, $expStr] = $parts;
+    $token = trim($token);
+    if (!$token) continue;
+    $activo = false; $dias = 999; $estado = 'activo';
+    if ($expStr) {
+        $exp = DateTime::createFromFormat('Y-m-d', $expStr);
+        if ($exp) {
+            $activo = $exp >= $hoy;
+            $dias = $activo ? $hoy->diff($exp)->days : 0;
+            if (!$activo) $estado = 'vencido';
+            elseif ($dias <= 2) $estado = 'por_vencer';
+            elseif ($dias <= 7) $estado = 'por_vencer_proximo';
+        }
+    } else { $activo = true; $dias = 999; $estado = 'ilimitado'; }
+    $usuarios[] = [
+        'token_id' => $token, 'alias' => $alias ?: '(sin alias)',
+        'host' => $host ?: VPS_HOST, 'fecha_expiracion' => $expStr ?: null,
+        'dias_restantes' => $dias, 'activo' => $activo, 'estado' => $estado,
+    ];
+}
+usort($usuarios, function($a, $b) {
+    $orden = ['por_vencer'=>1,'por_vencer_proximo'=>2,'activo'=>3,'ilimitado'=>4,'vencido'=>5];
+    return ($orden[$a['estado']] ?? 9) <=> ($orden[$b['estado']] ?? 9);
+});
+json(['ok'=>true, 'total'=>count($usuarios), 'vps'=>VPS_HOST, 'usuarios'=>$usuarios]);
+PHPEOF
+
+# ═══ 10. crear_usuario.php ═══
+cat > /var/www/html/api/crear_usuario.php <<'PHPEOF'
+<?php
+require 'config.php';
+checkApiKey();
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') json(['error' => 'POST only'], 405);
+$in = json_decode(file_get_contents('php://input'), true) ?: $_POST;
+$token = strtolower(preg_replace('/[^a-zA-Z0-9_]/', '', $in['token'] ?? ''));
+$alias = trim($in['alias'] ?? '');
+$dias  = max(1, min(365, (int)($in['dias'] ?? 30)));
+$gb    = max(0, (int)($in['gb'] ?? 0));
+if (strlen($token) < 6) json(['error'=>'Token inválido'], 400);
+if (strlen($token) > 32) json(['error'=>'Token muy largo'], 400);
+if ($alias === '') json(['error'=>'Falta alias'], 400);
+if (posix_getpwnam($token)) json(['error'=>'Token ya registrado'], 409);
+$cmd = sprintf('sudo /usr/local/bin/ssh-api-add.sh %s %s %d %d 2>&1',
+    escapeshellarg($token), escapeshellarg($alias), $dias, $gb);
+exec($cmd, $out, $rc);
+if ($rc !== 0 || !posix_getpwnam($token)) {
+    json(['error'=>'Falló la creación', 'rc'=>$rc, 'raw'=>implode("\n", $out)], 500);
+}
+$txt = leerTxt($token);
+$expStr = $txt['Exp'] ?? getExpira($token);
+json(['ok'=>true, 'token_id'=>$token, 'alias'=>$alias, 'dias'=>$dias, 'gb'=>$gb,
+    'host'=>VPS_HOST, 'fecha_expiracion'=>$expStr]);
+PHPEOF
+
+# ═══ 11. consultar_usuario.php ═══
+cat > /var/www/html/api/consultar_usuario.php <<'PHPEOF'
+<?php
+require 'config.php';
+checkApiKey();
+$token = preg_replace('/[^a-zA-Z0-9_]/', '', $_GET['token'] ?? '');
+if (!$token) json(['error'=>'Falta token'], 400);
+$d = leerTxt($token);
+if (!$d) json(['error'=>'Usuario no encontrado'], 404);
+$expStr = $d['Exp'] ?? getExpira($token);
+$hoy = new DateTime('today');
+$activo = false; $dias = 0;
+if ($expStr) {
+    $exp = DateTime::createFromFormat('Y-m-d', $expStr);
+    if ($exp) { $activo = $exp >= $hoy; $dias = $activo ? $hoy->diff($exp)->days : 0; }
+} else { $activo = true; $dias = 999; }
+json(['ok'=>true, 'token_id'=>$token, 'alias'=>$d['Alias'] ?? '',
+    'host'=>$d['Host'] ?? VPS_HOST, 'fecha_expiracion'=>$expStr,
+    'dias_restantes'=>$dias, 'activo'=>$activo]);
+PHPEOF
+
+# ═══ 12. eliminar_usuario.php ═══
+cat > /var/www/html/api/eliminar_usuario.php <<'PHPEOF'
+<?php
+require 'config.php';
+checkApiKey();
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') json(['error'=>'POST only'], 405);
+$in = json_decode(file_get_contents('php://input'), true) ?: $_POST;
+$token = preg_replace('/[^a-zA-Z0-9_]/', '', $in['token'] ?? '');
+if (!$token) json(['error'=>'Falta token'], 400);
+exec('sudo /usr/local/bin/ssh-api-del.sh ' . escapeshellarg($token) . ' 2>&1', $out, $rc);
+json(['ok'=>!posix_getpwnam($token), 'token_id'=>$token]);
+PHPEOF
+
+# ═══ 13. renovar_usuario.php ═══
+cat > /var/www/html/api/renovar_usuario.php <<'PHPEOF'
+<?php
+require 'config.php';
+checkApiKey();
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') json(['error'=>'POST only'], 405);
+$in = json_decode(file_get_contents('php://input'), true) ?: $_POST;
+$token = preg_replace('/[^a-zA-Z0-9_]/', '', $in['token'] ?? '');
+$dias  = max(1, min(365, (int)($in['dias'] ?? 30)));
+if (!$token) json(['error'=>'Falta token'], 400);
+if (!posix_getpwnam($token)) json(['error'=>'Usuario no existe'], 404);
+$expActual = getExpira($token);
+$hoy = new DateTime('today');
+$base = $expActual && new DateTime($expActual) >= $hoy ? new DateTime($expActual) : $hoy;
+$base->modify("+$dias days");
+$nuevaExp = $base->format('Y-m-d');
+exec('sudo /usr/bin/chage -E ' . escapeshellarg($nuevaExp) . ' ' . escapeshellarg($token) . ' 2>&1', $out, $rc);
+if ($rc !== 0) json(['error'=>'No se pudo renovar', 'raw'=>$out], 500);
+$d = leerTxt($token);
+json(['ok'=>true, 'token_id'=>$token, 'alias'=>$d['Alias'] ?? '',
+    'host'=>$d['Host'] ?? VPS_HOST, 'fecha_expiracion'=>$nuevaExp,
+    'dias_restantes'=>$hoy->diff(new DateTime($nuevaExp))->days]);
+PHPEOF
+
+# ═══ 14. cambiar_password.php ═══
+cat > /var/www/html/api/cambiar_password.php <<'PHPEOF'
+<?php
+require 'config.php';
+checkApiKey();
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') json(['error' => 'POST only'], 405);
+$in = json_decode(file_get_contents('php://input'), true) ?: $_POST;
+$newPass    = trim($in['password'] ?? '');
+$actualizar = !empty($in['actualizar_existentes']);
+if (strlen($newPass) < 6) json(['error' => 'Muy corta (mín 6)'], 400);
+if (strlen($newPass) > 64) json(['error' => 'Muy larga (máx 64)'], 400);
+if (!preg_match('/^[a-zA-Z0-9_\-\.@#!]+$/', $newPass)) json(['error' => 'Caracteres inválidos'], 400);
+$archivo = '/etc/reagens_base_pass';
+if (@file_get_contents($archivo) === false) json(['error' => 'No se puede leer ' . $archivo], 500);
+@copy($archivo, $archivo . '.bak.' . date('YmdHis'));
+if (file_put_contents($archivo, $newPass, LOCK_EX) === false) {
+    json(['error' => 'No se pudo escribir ' . $archivo], 500);
+}
+$actualizados = 0;
+if ($actualizar) {
+    $dbFile = '/etc/adm-lite/usuarios_token.db';
+    if (is_file($dbFile)) {
+        foreach (file($dbFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line) {
+            $parts = explode('|', $line);
+            $token = preg_replace('/[^a-zA-Z0-9_]/', '', $parts[0] ?? '');
+            if (!$token || !posix_getpwnam($token)) continue;
+            exec(sprintf('echo %s | sudo /usr/sbin/chpasswd 2>&1',
+                escapeshellarg("$token:$newPass")), $o, $r);
+            if ($r !== 0) continue;
+            $txt = '/var/www/html/ssh-' . $token . '.txt';
+            if (is_file($txt)) {
+                $c = file_get_contents($txt);
+                $c = preg_replace('/^Password:.*$/m', 'Password: ' . $newPass, $c);
+                file_put_contents($txt, $c, LOCK_EX);
+            }
+            $hyFile = '/etc/hysteria2/users.txt';
+            if (is_file($hyFile)) {
+                $hc = file_get_contents($hyFile);
+                $hc = preg_replace('/^(' . preg_quote($token, '/') . ') [^ ]+ /m', '$1 ' . $newPass . ' ', $hc);
+                file_put_contents($hyFile, $hc, LOCK_EX);
+            }
+            $actualizados++;
+        }
+    }
+}
+json(['ok'=>true, 'actualizados'=>$actualizados,
+    'mensaje'=>'Contraseña actualizada'.($actualizar ? " y aplicada a $actualizados usuarios" : '')]);
+PHPEOF
+
+# ═══ 15. Permisos ═══
+chown -R www-data:www-data /var/www/html/api
+chmod 644 /var/www/html/api/*.php
+touch /var/log/ssh-api.log
+chown www-data:www-data /var/log/ssh-api.log
+chmod 664 /var/log/ssh-api.log
+log "PHP OK"
+
+# ═══ 16. Firewall ═══
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    ufw allow $APACHE_PORT/tcp >/dev/null 2>&1 || true
+    ufw allow $APACHE_SSL_PORT/tcp >/dev/null 2>&1 || true
+    log "UFW: puertos abiertos"
+fi
+
+# ═══ 17. Guardar datos ═══
+cat > /root/panel_data.txt <<EOF
+═══ AndyLuxor Panel — Datos de instalación ═══
+Fecha       : $(date)
+Hostname    : $VPS_HOSTNAME
+Dominio     : $FULL_DOMAIN
+API_KEY     : $API_KEY
+Pass general: $GENERAL_PASS
+════════════════════════════════════════════════
+EOF
+chmod 600 /root/panel_data.txt
+
+# ═══ 18. Resumen ═══
+echo
+echo -e "${G}${BOLD}════════════════════════════════════════════════════════════${N}"
+echo -e "${G}${BOLD}              ✓  INSTALACIÓN COMPLETA${N}"
+echo -e "${G}${BOLD}════════════════════════════════════════════════════════════${N}"
+echo
+echo -e "${Y}${BOLD}┌────────────────────────────────────────────────────────────┐${N}"
+echo -e "${Y}${BOLD}│  🔑  API KEY — GUARDA ESTA CLAVE                          │${N}"
+echo -e "${Y}${BOLD}│      La necesitarás para acceder al panel admin          │${N}"
+echo -e "${Y}${BOLD}└────────────────────────────────────────────────────────────┘${N}"
+echo
+echo -e "  ${C}${BOLD}${API_KEY}${N}"
+echo
+echo -e "${DIM}  (También en /root/panel_data.txt)${N}"
+echo
+echo -e "${M}${BOLD}═══ DATOS DE ACCESO ═══${N}"
+echo
+echo -e "  ${B}URL del panel${N}   : ${C}https://${FULL_DOMAIN}/admin.html${N}"
+echo -e "  ${B}API Key${N}         : ${Y}${API_KEY}${N}"
+echo -e "  ${B}Pass general${N}    : ${GENERAL_PASS}"
+echo -e "  ${B}Hostname${N}        : ${VPS_HOSTNAME}"
+echo -e "  ${B}Dominio base${N}    : ${DOMINIO_BASE}"
+echo
+echo -e "${M}${BOLD}═══ PRÓXIMOS PASOS ═══${N}"
+echo
+echo -e "  ${B}1.${N} Cloudflare:"
+echo -e "     ${DIM}• DNS: A ${VPS_HOSTNAME} → IP  (Proxied 🟠)${N}"
+echo -e "     ${DIM}• SSL/TLS: Full (strict)${N}"
+echo -e "     ${DIM}• Origin Rules → puerto 8443${N}"
+echo -e "     ${DIM}• Origin Cert → /etc/ssl/cloudflare/${N}"
+echo
+echo -e "  ${B}2.${N} Copiar ${C}admin.html${N}:"
+echo -e "     ${DIM}curl -s -o /var/www/html/admin.html https://raw.githubusercontent.com/TU_USER/andy-setup/main/admin.html${N}"
+echo
+echo -e "  ${B}3.${N} Probar: ${C}https://${FULL_DOMAIN}/admin.html${N}"
+echo
+echo -e "${G}${BOLD}════════════════════════════════════════════════════════════${N}"
+echo

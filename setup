@@ -1,6 +1,6 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════════════
-#  AndyLuxor Panel — Instalador v1.0
+#  AndyLuxor Panel — Instalador v2.0 (con Origin Cert)
 #  Uso: sudo bash setup
 # ═══════════════════════════════════════════════════════════════════════
 set -euo pipefail
@@ -18,7 +18,7 @@ echo -e "${M}${BOLD}"
 cat <<'BANNER'
    ╔══════════════════════════════════════════════════════════════╗
    ║                                                              ║
-   ║        🛰️  ANDYLUXOR PANEL  —  INSTALADOR v1.0  🛰️         ║
+   ║        🛰️  ANDYLUXOR PANEL  —  INSTALADOR v2.0  🛰️         ║
    ║                                                              ║
    ╚══════════════════════════════════════════════════════════════╝
 BANNER
@@ -26,12 +26,12 @@ echo -e "${N}"
 
 [[ $EUID -ne 0 ]] && err "Debes ejecutar como root"
 
-# ═══ Parámetros ═══
+# ═══ CONFIGURACIÓN ═══
 echo -e "${M}${BOLD}═══ CONFIGURACIÓN DEL PANEL ═══${N}"
 echo
 
 while true; do
-    read -p "$(echo -e "${C}?${N} Subdominio (ej: arg1, cl, br): ")" VPS_HOSTNAME
+    read -p "$(echo -e "${C}?${N} Subdominio del PANEL (ej: ar1, cl, br): ")" VPS_HOSTNAME
     VPS_HOSTNAME=$(echo "$VPS_HOSTNAME" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
     [[ "$VPS_HOSTNAME" =~ ^[a-z0-9-]{2,32}$ ]] && break
     warn "Solo minúsculas/números/guiones (2-32 chars)"
@@ -53,15 +53,62 @@ while true; do
     warn "No coinciden o son muy cortas (mín 6)"
 done
 
-API_KEY=$(openssl rand -hex 32)
 FULL_DOMAIN="${VPS_HOSTNAME}.${DOMINIO_BASE}"
+API_KEY=$(openssl rand -hex 32)
 
+# ═══ ORIGIN CERT ═══
+echo
+echo -e "${M}${BOLD}═══ ORIGIN CERTIFICATE (Cloudflare) ═══${N}"
+echo
+echo -e "${DIM}  Obtenelo en: Cloudflare → SSL/TLS → Origin Server → Create Certificate${N}"
+echo -e "${DIM}  Hostnames: *.${DOMINIO_BASE} y ${DOMINIO_BASE}${N}"
+echo
+echo -e "${Y}Opción A${N}: Pegar el certificado ahora (recomendado)"
+echo -e "${Y}Opción B${N}: Presionar ENTER sin pegar nada → se configura después a mano"
+echo
+read -p "$(echo -e "${C}?${N} ¿Pegar el Origin Certificate ahora? (s/n): ")" PEGAR_CERT
+
+CERT_PEM=""
+CERT_KEY=""
+
+if [[ "$PEGAR_CERT" == "s" ]]; then
+    echo
+    echo -e "${B}→${N} Pega el ${BOLD}Origin Certificate${N} (termina con ${DIM}-----END CERTIFICATE-----${N})"
+    echo -e "${DIM}  Luego presioná ENTER${N}"
+    echo
+    while IFS= read -r line; do
+        CERT_PEM+="$line"$'\n'
+        [[ "$line" == *"-----END CERTIFICATE-----"* ]] && break
+    done
+
+    echo
+    echo -e "${B}→${N} Pega la ${BOLD}Private Key${N} (termina con ${DIM}-----END PRIVATE KEY-----${N})"
+    echo -e "${DIM}  Luego presioná ENTER${N}"
+    echo
+    while IFS= read -r line; do
+        CERT_KEY+="$line"$'\n'
+        [[ "$line" == *"-----END PRIVATE KEY-----"* ]] && break
+    done
+
+    # Validar
+    if echo "$CERT_PEM" | grep -q "BEGIN CERTIFICATE" && \
+       echo "$CERT_KEY" | grep -q "BEGIN PRIVATE KEY"; then
+        log "Certificado capturado correctamente"
+    else
+        warn "El certificado o la key no tienen el formato esperado"
+        read -p "$(echo -e "${C}?${N} ¿Continuar igual? (s/n): ")" CONT
+        [[ "$CONT" != "s" ]] && exit 1
+    fi
+fi
+
+# ═══ RESUMEN ═══
 echo
 echo -e "${M}${BOLD}═══ RESUMEN ═══${N}"
 echo -e "  Hostname      : ${VPS_HOSTNAME}"
 echo -e "  Dominio base  : ${DOMINIO_BASE}"
 echo -e "  Dominio final : ${C}${FULL_DOMAIN}${N}"
 echo -e "  Pass general  : ${DIM}••••••••${N}"
+echo -e "  Origin Cert   : $([ -n "$CERT_PEM" ] && echo "${G}Sí${N}" || echo "${Y}No (configurar después)${N}")"
 echo
 read -p "$(echo -e "${C}?${N} ¿Continuar? (s/n): ")" CONFIRM
 [[ "$CONFIRM" != "s" ]] && { warn "Cancelado"; exit 0; }
@@ -105,28 +152,46 @@ cat > /etc/apache2/sites-available/000-default.conf <<EOF
 </VirtualHost>
 EOF
 
-a2enmod rewrite headers >/dev/null
+a2enmod rewrite headers ssl >/dev/null
 apachectl configtest 2>&1 | grep -q "Syntax OK" || err "Apache config inválido"
 systemctl restart apache2
 systemctl enable apache2 >/dev/null 2>&1
-log "Apache OK en :$APACHE_PORT"
+log "Apache OK en :$APACHE_PORT y :$APACHE_SSL_PORT"
 
 # ═══ 3. Estructura ═══
-mkdir -p /var/www/html/api /etc/ssh-api /usr/local/bin
+mkdir -p /var/www/html/api /etc/ssh-api /usr/local/bin /etc/ssl/cloudflare
 
 # ═══ 4. Passwords ═══
 [ ! -f /etc/reagens_base_pass ] && echo -n "$GENERAL_PASS" > /etc/reagens_base_pass
 echo -n "$GENERAL_PASS" > /etc/ssh-api/general_password
-chmod 644 /etc/reagens_base_pass
+chmod 664 /etc/reagens_base_pass
 chown root:www-data /etc/reagens_base_pass
 chmod 600 /etc/ssh-api/general_password
 chown root:root /etc/ssh-api/general_password
 log "Contraseñas OK"
 
-# ═══ 5. expect-token.exp ═══
+# ═══ 5. Origin Cert ═══
+if [ -n "$CERT_PEM" ] && [ -n "$CERT_KEY" ]; then
+    echo "$CERT_PEM" > /etc/ssl/cloudflare/origin.pem
+    echo "$CERT_KEY" > /etc/ssl/cloudflare/origin.key
+    chmod 644 /etc/ssl/cloudflare/origin.pem
+    chmod 600 /etc/ssl/cloudflare/origin.key
+    chown root:root /etc/ssl/cloudflare/*
+
+    # Verificar
+    if openssl x509 -in /etc/ssl/cloudflare/origin.pem -noout -subject 2>/dev/null | grep -q "CloudFlare"; then
+        log "Origin Cert válido"
+    else
+        warn "No se pudo verificar el Origin Cert"
+    fi
+else
+    warn "Origin Cert NO configurado (configuralo después en /etc/ssl/cloudflare/)"
+fi
+
+# ═══ 6. expect-token.exp ═══
 cat > /usr/local/bin/expect-token.exp <<'EXPECTEOF'
 #!/usr/bin/expect -f
-set timeout 60
+set timeout 30
 log_user 1
 set env(LANG) "C.UTF-8"
 set env(LC_ALL) "C.UTF-8"
@@ -135,28 +200,41 @@ set alias [lindex $argv 1]
 set dias  [lindex $argv 2]
 set gb    [lindex $argv 3]
 spawn /bin/addssh
-expect { -re {Opc \[1-6/x\]:}  { sleep 0.3; send "3\r" } timeout { exit 91 } }
-expect { -re {Nombre del Cliente}  { sleep 0.3; send "$alias\r" } timeout { exit 92 } }
-expect { -re {Ingresa el TOKEN}  { sleep 0.3; send "$token\r" } timeout { exit 93 } }
 expect {
-    -re {D.{1,3}as de duraci}  { sleep 0.3; send "$dias\r" }
-    -re {D.as de duraci}       { sleep 0.3; send "$dias\r" }
-    timeout { exit 94 }
+    -re {1-6/x\]}  { sleep 0.5; send "3\r" }
+    timeout { puts "\n>>> TIMEOUT_MENU"; exit 91 }
 }
 expect {
-    -re {L.{0,3}mite de Datos}  { sleep 0.3; send "$gb\r" }
-    -re {mite de Datos}         { sleep 0.3; send "$gb\r" }
-    timeout { exit 95 }
+    -re {Alias}  { sleep 0.5; send "$alias\r" }
+    timeout { puts "\n>>> TIMEOUT_ALIAS"; exit 92 }
 }
-expect { -re {Crear usuario\?}  { sleep 0.3; send "s\r" } timeout { exit 96 } }
-expect { -re {Presione enter}  { sleep 0.3; send "\r" } timeout { } }
+expect {
+    -re {TOKEN}  { sleep 0.5; send "$token\r" }
+    timeout { puts "\n>>> TIMEOUT_TOKEN"; exit 93 }
+}
+expect {
+    -re {duraci}  { sleep 0.5; send "$dias\r" }
+    timeout { puts "\n>>> TIMEOUT_DIAS"; exit 94 }
+}
+expect {
+    -re {Datos}  { sleep 0.5; send "$gb\r" }
+    timeout { puts "\n>>> TIMEOUT_GB"; exit 95 }
+}
+expect {
+    -re {Crear usuario}  { sleep 0.5; send "s\r" }
+    timeout { puts "\n>>> TIMEOUT_CONFIRM"; exit 96 }
+}
+expect {
+    -re {Presione enter}  { sleep 0.5; send "\r" }
+    timeout { }
+}
 expect eof
 exit 0
 EXPECTEOF
 chmod 755 /usr/local/bin/expect-token.exp
 log "expect-token.exp OK"
 
-# ═══ 6. Wrappers ═══
+# ═══ 7. Wrappers ═══
 cat > /usr/local/bin/ssh-api-add.sh <<'ADDEOF'
 #!/bin/bash
 set -euo pipefail
@@ -175,10 +253,13 @@ TOKEN="${1:-}"
 [[ -z "$TOKEN" ]] && { echo "Falta token"; exit 1; }
 [[ ! "$TOKEN" =~ ^[a-zA-Z0-9_]{6,32}$ ]] && { echo "Token inválido"; exit 1; }
 export LC_ALL=C
+echo ">>> Eliminando $TOKEN"
+
 [ -f /etc/adm-lite/usuarios_token.db ] && sed -i "/^${TOKEN}|/d" /etc/adm-lite/usuarios_token.db
 [ -f /etc/ssh/.ssh.db ] && sed -i "/^### ${TOKEN} /d" /etc/ssh/.ssh.db
+
 if [ -f /etc/ssh/traffic.db ]; then
-python3 - "$TOKEN" <<'PYEOF'
+python3 - "$TOKEN" <<'PYEOF' 2>/dev/null
 import json, sys
 try:
     with open("/etc/ssh/traffic.db") as f: d = json.load(f)
@@ -187,9 +268,11 @@ try:
 except: pass
 PYEOF
 fi
+
 [ -f /etc/hysteria2/users.txt ] && sed -i "/^${TOKEN} /d" /etc/hysteria2/users.txt
+
 if [ -f /etc/ssh/quotas.db ]; then
-python3 - "$TOKEN" <<'PYEOF'
+python3 - "$TOKEN" <<'PYEOF' 2>/dev/null
 import json, sys
 try:
     with open("/etc/ssh/quotas.db") as f: d = json.load(f)
@@ -198,12 +281,18 @@ try:
 except: pass
 PYEOF
 fi
-rm -f "/etc/ssh/sshd_config.d/${TOKEN}.conf"
-rm -f "/etc/ssh/banners/banner_${TOKEN}.txt"
-rm -f "/var/www/html/ssh-${TOKEN}.txt"
-id "$TOKEN" >/dev/null 2>&1 && userdel "$TOKEN" 2>/dev/null
+
+rm -f "/etc/ssh/sshd_config.d/${TOKEN}.conf" 2>/dev/null
+rm -f "/etc/ssh/banners/banner_${TOKEN}.txt" 2>/dev/null
+rm -f "/var/www/html/ssh-${TOKEN}.txt" 2>/dev/null
+
+if id "$TOKEN" >/dev/null 2>&1; then
+    userdel "$TOKEN" 2>/dev/null || true
+fi
+
 systemctl reload ssh 2>/dev/null || true
-echo ">>> Eliminado $TOKEN"
+echo ">>> Listo"
+exit 0
 DELEOF
 
 cat > /usr/local/bin/ssh-api-list.sh <<'LISTEOF'
@@ -212,6 +301,7 @@ export LC_ALL=C
 for f in /var/www/html/ssh-*.txt; do
     [ -e "$f" ] || continue
     token=$(basename "$f" | sed 's/^ssh-//;s/\.txt$//')
+    id "$token" >/dev/null 2>&1 || continue
     alias=$(grep -m1 '^Alias:' "$f" 2>/dev/null | cut -d: -f2- | sed 's/^ *//;s/ *$//')
     host=$(grep -m1 '^Host:' "$f" 2>/dev/null | cut -d: -f2- | sed 's/^ *//;s/ *$//')
     exp_raw=$(chage -l "$token" 2>/dev/null | grep -i 'Account expires' | cut -d: -f2- | sed 's/^ *//;s/ *$//')
@@ -225,14 +315,14 @@ LISTEOF
 chmod 755 /usr/local/bin/ssh-api-add.sh /usr/local/bin/ssh-api-del.sh /usr/local/bin/ssh-api-list.sh
 log "Wrappers OK"
 
-# ═══ 7. Sudoers ═══
+# ═══ 8. Sudoers ═══
 cat > /etc/sudoers.d/ssh-api <<'SUDOEOF'
 www-data ALL=(root) NOPASSWD: /usr/bin/chage, /usr/bin/expect, /usr/sbin/userdel, /usr/sbin/chpasswd, /usr/local/bin/expect-token.exp, /usr/local/bin/ssh-api-add.sh, /usr/local/bin/ssh-api-list.sh, /usr/local/bin/ssh-api-del.sh, /bin/dellssh, /bin/renewssh
 SUDOEOF
 chmod 440 /etc/sudoers.d/ssh-api
 log "Sudoers OK"
 
-# ═══ 8. config.php ═══
+# ═══ 9. config.php ═══
 cat > /var/www/html/api/config.php <<PHPEOF
 <?php
 define('API_KEY', '${API_KEY}');
@@ -254,7 +344,14 @@ function json(\$d, \$c = 200) {
     header('Access-Control-Allow-Headers: Content-Type, X-API-Key');
     header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
     if (\$_SERVER['REQUEST_METHOD'] === 'OPTIONS') exit;
-    echo json_encode(\$d, JSON_UNESCAPED_UNICODE);
+    \$j = json_encode(\$d, JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
+    if (\$j === false) {
+        error_log('json_encode falló: ' . json_last_error_msg());
+        http_response_code(500);
+        echo '{"error":"json_encode falló","reason":"' . json_last_error_msg() . '"}';
+        exit;
+    }
+    echo \$j;
     exit;
 }
 function leerTxt(\$token) {
@@ -286,7 +383,7 @@ function getExpira(\$token) {
 }
 PHPEOF
 
-# ═══ 9. listar_usuarios.php ═══
+# ═══ 10. listar_usuarios.php ═══
 cat > /var/www/html/api/listar_usuarios.php <<'PHPEOF'
 <?php
 require 'config.php';
@@ -324,7 +421,7 @@ usort($usuarios, function($a, $b) {
 json(['ok'=>true, 'total'=>count($usuarios), 'vps'=>VPS_HOST, 'usuarios'=>$usuarios]);
 PHPEOF
 
-# ═══ 10. crear_usuario.php ═══
+# ═══ 11. crear_usuario.php ═══
 cat > /var/www/html/api/crear_usuario.php <<'PHPEOF'
 <?php
 require 'config.php';
@@ -351,7 +448,7 @@ json(['ok'=>true, 'token_id'=>$token, 'alias'=>$alias, 'dias'=>$dias, 'gb'=>$gb,
     'host'=>VPS_HOST, 'fecha_expiracion'=>$expStr]);
 PHPEOF
 
-# ═══ 11. consultar_usuario.php ═══
+# ═══ 12. consultar_usuario.php ═══
 cat > /var/www/html/api/consultar_usuario.php <<'PHPEOF'
 <?php
 require 'config.php';
@@ -372,7 +469,7 @@ json(['ok'=>true, 'token_id'=>$token, 'alias'=>$d['Alias'] ?? '',
     'dias_restantes'=>$dias, 'activo'=>$activo]);
 PHPEOF
 
-# ═══ 12. eliminar_usuario.php ═══
+# ═══ 13. eliminar_usuario.php ═══
 cat > /var/www/html/api/eliminar_usuario.php <<'PHPEOF'
 <?php
 require 'config.php';
@@ -385,7 +482,7 @@ exec('sudo /usr/local/bin/ssh-api-del.sh ' . escapeshellarg($token) . ' 2>&1', $
 json(['ok'=>!posix_getpwnam($token), 'token_id'=>$token]);
 PHPEOF
 
-# ═══ 13. renovar_usuario.php ═══
+# ═══ 14. renovar_usuario.php (CON SINCRONIZACIÓN COMPLETA) ═══
 cat > /var/www/html/api/renovar_usuario.php <<'PHPEOF'
 <?php
 require 'config.php';
@@ -396,20 +493,70 @@ $token = preg_replace('/[^a-zA-Z0-9_]/', '', $in['token'] ?? '');
 $dias  = max(1, min(365, (int)($in['dias'] ?? 30)));
 if (!$token) json(['error'=>'Falta token'], 400);
 if (!posix_getpwnam($token)) json(['error'=>'Usuario no existe'], 404);
+
 $expActual = getExpira($token);
 $hoy = new DateTime('today');
-$base = $expActual && new DateTime($expActual) >= $hoy ? new DateTime($expActual) : $hoy;
+$base = $expActual && new DateTime($expActual) >= $hoy ? new DateTime($expActual) : clone $hoy;
 $base->modify("+$dias days");
 $nuevaExp = $base->format('Y-m-d');
+
+// 1. /etc/shadow
 exec('sudo /usr/bin/chage -E ' . escapeshellarg($nuevaExp) . ' ' . escapeshellarg($token) . ' 2>&1', $out, $rc);
-if ($rc !== 0) json(['error'=>'No se pudo renovar', 'raw'=>$out], 500);
+if ($rc !== 0) json(['error'=>'No se pudo renovar (chage)', 'raw'=>$out], 500);
+
+// 2. adm-lite
+$dbFile = '/etc/adm-lite/usuarios_token.db';
+if (is_file($dbFile)) {
+    $lines = file($dbFile, FILE_IGNORE_NEW_LINES);
+    $new = [];
+    foreach ($lines as $line) {
+        if (strpos($line, $token . '|') === 0) {
+            $parts = explode('|', $line);
+            $alias = $parts[1] ?? '';
+            $diasTotales = $hoy->diff(new DateTime($nuevaExp))->days;
+            $new[] = "$token|$alias|$diasTotales";
+        } else { $new[] = $line; }
+    }
+    file_put_contents($dbFile, implode("\n", $new) . "\n", LOCK_EX);
+}
+
+// 3. .ssh.db
+$sshDb = '/etc/ssh/.ssh.db';
+if (is_file($sshDb)) {
+    $lines = file($sshDb, FILE_IGNORE_NEW_LINES);
+    $new = [];
+    foreach ($lines as $line) {
+        if (preg_match('/^### ' . preg_quote($token, '/') . ' /', $line)) {
+            $new[] = "### $token $nuevaExp";
+        } else { $new[] = $line; }
+    }
+    file_put_contents($sshDb, implode("\n", $new) . "\n", LOCK_EX);
+}
+
+// 4. hysteria2
+$hyFile = '/etc/hysteria2/users.txt';
+if (is_file($hyFile)) {
+    $lines = file($hyFile, FILE_IGNORE_NEW_LINES);
+    $new = [];
+    foreach ($lines as $line) {
+        if (preg_match('/^' . preg_quote($token, '/') . ' ([^ ]+) /', $line, $m)) {
+            $new[] = "$token {$m[1]} $nuevaExp";
+        } else { $new[] = $line; }
+    }
+    file_put_contents($hyFile, implode("\n", $new) . "\n", LOCK_EX);
+}
+
+file_put_contents('/var/log/ssh-api.log',
+    date('c') . " RENOVAR token=$token dias=$dias nuevaExp=$nuevaExp ip={$_SERVER['REMOTE_ADDR']}\n",
+    FILE_APPEND);
+
 $d = leerTxt($token);
 json(['ok'=>true, 'token_id'=>$token, 'alias'=>$d['Alias'] ?? '',
     'host'=>$d['Host'] ?? VPS_HOST, 'fecha_expiracion'=>$nuevaExp,
     'dias_restantes'=>$hoy->diff(new DateTime($nuevaExp))->days]);
 PHPEOF
 
-# ═══ 14. cambiar_password.php ═══
+# ═══ 15. cambiar_password.php ═══
 cat > /var/www/html/api/cambiar_password.php <<'PHPEOF'
 <?php
 require 'config.php';
@@ -458,22 +605,64 @@ json(['ok'=>true, 'actualizados'=>$actualizados,
     'mensaje'=>'Contraseña actualizada'.($actualizar ? " y aplicada a $actualizados usuarios" : '')]);
 PHPEOF
 
-# ═══ 15. Permisos ═══
+# ═══ 16. Vhost SSL ═══
+cat > /etc/apache2/sites-available/panel-ssl.conf <<EOF
+<VirtualHost *:$APACHE_SSL_PORT>
+    ServerName $FULL_DOMAIN
+    DocumentRoot /var/www/html
+
+    SSLEngine on
+    SSLCertificateFile    /etc/ssl/cloudflare/origin.pem
+    SSLCertificateKeyFile /etc/ssl/cloudflare/origin.key
+
+    SSLProtocol           all -SSLv3 -TLSv1 -TLSv1.1
+    SSLHonorCipherOrder   off
+
+    <Directory /var/www/html>
+        Options -Indexes +FollowSymLinks
+        AllowOverride All
+        Require all granted
+    </Directory>
+
+    Header always set X-Content-Type-Options "nosniff"
+    Header always set X-Frame-Options "SAMEORIGIN"
+
+    ErrorLog \${APACHE_LOG_DIR}/panel-ssl-error.log
+    CustomLog \${APACHE_LOG_DIR}/panel-ssl-access.log combined
+</VirtualHost>
+EOF
+
+a2ensite panel-ssl.conf >/dev/null 2>&1
+a2dissite 000-default 2>/dev/null || true
+
+# ═══ 17. Verificar y reiniciar ═══
+apachectl configtest 2>&1 | grep -q "Syntax OK" || warn "Apache config tiene advertencias"
+systemctl restart apache2
+log "Apache reiniciado"
+
+# ═══ 18. Permisos de archivos del panel ═══
+# Archivos que el panel necesita leer/escribir
+[ -f /etc/adm-lite/usuarios_token.db ] && chown root:www-data /etc/adm-lite/usuarios_token.db && chmod 664 /etc/adm-lite/usuarios_token.db
+[ -f /etc/ssh/.ssh.db ]                && chown root:www-data /etc/ssh/.ssh.db                && chmod 664 /etc/ssh/.ssh.db
+[ -f /etc/ssh/traffic.db ]             && chown root:www-data /etc/ssh/traffic.db             && chmod 664 /etc/ssh/traffic.db
+[ -f /etc/ssh/quotas.db ]              && chown root:www-data /etc/ssh/quotas.db              && chmod 664 /etc/ssh/quotas.db
+[ -f /etc/hysteria2/users.txt ]        && chown root:www-data /etc/hysteria2/users.txt        && chmod 664 /etc/hysteria2/users.txt
+
 chown -R www-data:www-data /var/www/html/api
 chmod 644 /var/www/html/api/*.php
 touch /var/log/ssh-api.log
 chown www-data:www-data /var/log/ssh-api.log
 chmod 664 /var/log/ssh-api.log
-log "PHP OK"
+log "Permisos OK"
 
-# ═══ 16. Firewall ═══
+# ═══ 19. Firewall ═══
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
     ufw allow $APACHE_PORT/tcp >/dev/null 2>&1 || true
     ufw allow $APACHE_SSL_PORT/tcp >/dev/null 2>&1 || true
     log "UFW: puertos abiertos"
 fi
 
-# ═══ 17. Guardar datos ═══
+# ═══ 20. Guardar datos ═══
 cat > /root/panel_data.txt <<EOF
 ═══ AndyLuxor Panel — Datos de instalación ═══
 Fecha       : $(date)
@@ -481,11 +670,12 @@ Hostname    : $VPS_HOSTNAME
 Dominio     : $FULL_DOMAIN
 API_KEY     : $API_KEY
 Pass general: $GENERAL_PASS
+Origin Cert : $([ -n "$CERT_PEM" ] && echo "Configurado" || echo "PENDIENTE")
 ════════════════════════════════════════════════
 EOF
 chmod 600 /root/panel_data.txt
 
-# ═══ 18. Resumen ═══
+# ═══ 21. Resumen ═══
 echo
 echo -e "${G}${BOLD}════════════════════════════════════════════════════════════${N}"
 echo -e "${G}${BOLD}              ✓  INSTALACIÓN COMPLETA${N}"
@@ -507,19 +697,26 @@ echo -e "  ${B}API Key${N}         : ${Y}${API_KEY}${N}"
 echo -e "  ${B}Pass general${N}    : ${GENERAL_PASS}"
 echo -e "  ${B}Hostname${N}        : ${VPS_HOSTNAME}"
 echo -e "  ${B}Dominio base${N}    : ${DOMINIO_BASE}"
+echo -e "  ${B}Origin Cert${N}     : $([ -n "$CERT_PEM" ] && echo "${G}✓ Configurado${N}" || echo "${Y}⚠ Pendiente${N}")"
 echo
-echo -e "${M}${BOLD}═══ PRÓXIMOS PASOS ═══${N}"
+echo -e "${M}${BOLD}═══ VERIFICAR ═══${N}"
 echo
-echo -e "  ${B}1.${N} Cloudflare:"
-echo -e "     ${DIM}• DNS: A ${VPS_HOSTNAME} → IP  (Proxied 🟠)${N}"
-echo -e "     ${DIM}• SSL/TLS: Full (strict)${N}"
-echo -e "     ${DIM}• Origin Rules → puerto 8443${N}"
-echo -e "     ${DIM}• Origin Cert → /etc/ssl/cloudflare/${N}"
+echo -e "  ${B}Apache${N}     : ${C}ss -tlnp | grep apache${N}"
+echo -e "  ${B}API local${N}  : ${C}curl -s http://127.0.0.1:${APACHE_PORT}/api/listar_usuarios.php -H 'X-API-Key: ${API_KEY}'${N}"
+echo -e "  ${B}API HTTPS${N}  : ${C}curl -sk https://127.0.0.1:${APACHE_SSL_PORT}/api/listar_usuarios.php -H 'X-API-Key: ${API_KEY}'${N}"
 echo
-echo -e "  ${B}2.${N} Copiar ${C}admin.html${N}:"
-echo -e "     ${DIM}curl -s -o /var/www/html/admin.html https://raw.githubusercontent.com/TU_USER/andy-setup/main/admin.html${N}"
-echo
-echo -e "  ${B}3.${N} Probar: ${C}https://${FULL_DOMAIN}/admin.html${N}"
-echo
+
+if [ -z "$CERT_PEM" ]; then
+    echo -e "${R}${BOLD}⚠  FALTA CONFIGURAR EL ORIGIN CERT ═══${N}"
+    echo
+    echo -e "  1. Cloudflare → SSL/TLS → Origin Server → Create Certificate"
+    echo -e "  2. Guardar en:"
+    echo -e "     ${C}nano /etc/ssl/cloudflare/origin.pem${N}   (pegar cert)"
+    echo -e "     ${C}nano /etc/ssl/cloudflare/origin.key${N}   (pegar key)"
+    echo -e "     ${C}chmod 600 /etc/ssl/cloudflare/origin.key${N}"
+    echo -e "  3. ${C}systemctl restart apache2${N}"
+    echo
+fi
+
 echo -e "${G}${BOLD}════════════════════════════════════════════════════════════${N}"
 echo
